@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#define _GNU_SOURCE
 #define FUSE_USE_VERSION 26
 
 #ifdef linux
@@ -20,11 +21,14 @@
 
 #include <stdio.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-
+#include <sys/statvfs.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 // littefs-fuse version
 //
@@ -46,6 +50,126 @@ static bool format = false;
 static bool migrate = false;
 static lfs_t lfs;
 
+static uint8_t s_key[64] = {0};
+size_t s_key_len = 0;
+
+static unsigned long s_mount_flags = 0;
+static char *s_mountpoint = NULL;
+
+#define RELATIME_THRESHOLD (24 * 60 * 60)
+// #define RELATIME_THRESHOLD 10 // For testing
+
+#define LFS_ATTR_UTIMENS 0x54 // 'T'
+
+struct lfs_timens {
+    uint32_t sec;
+    uint32_t nsec;
+} __attribute__((packed));
+
+struct lfs_attr_utimens {
+    struct lfs_timens ctime;
+    struct lfs_timens mtime;
+    struct lfs_timens atime;
+} __attribute__((packed));
+
+static void lfs_ts_to_tns(const struct timespec *ts, struct lfs_timens *tns) {
+  tns->sec = ts->tv_sec;
+  tns->nsec = ts->tv_nsec;
+}
+
+static void lfs_tv_to_tns(const struct timeval *tv, struct lfs_timens *tns) {
+  tns->sec = tv->tv_sec;
+  tns->nsec = tv->tv_usec * 1000;
+}
+
+static bool lfs_get_utimens(lfs_t *lfs, const char *path, struct lfs_attr_utimens *ut) {
+  return (lfs_getattr(lfs, path, LFS_ATTR_UTIMENS, ut, sizeof(*ut)) >= sizeof(*ut));
+}
+
+static bool lfs_set_utimens(lfs_t *lfs, const char *path, const struct lfs_attr_utimens *ut) {
+  return (lfs_setattr(lfs, path, LFS_ATTR_UTIMENS, ut, sizeof(*ut)) == LFS_ERR_OK);
+}
+
+static bool check_relatime(const struct timeval *now, struct lfs_attr_utimens *uts) {
+  bool a = true;
+  if (s_mount_flags & ST_RELATIME) {
+      const uint32_t m_sec = uts->mtime.sec;
+      const uint32_t a_sec = uts->atime.sec;
+      if (a_sec >= m_sec && now->tv_sec - a_sec < RELATIME_THRESHOLD) {
+          a = false;
+      }
+  }
+  if (a) {
+      lfs_tv_to_tns(now, &uts->atime);
+  }
+  return a;
+}
+
+static void lfs_update_utimens(lfs_t *lfs, const char *path, bool c, bool m, bool a) {
+  if (a && !c && !m && (s_mount_flags & ST_NOATIME)) {
+    return;
+  }
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  struct lfs_attr_utimens uts = {0};
+  if (!lfs_get_utimens(lfs, path, &uts)) {
+    c = m = a = true;
+  }
+  if (c) lfs_tv_to_tns(&now, &uts.ctime);
+  if (m) lfs_tv_to_tns(&now, &uts.mtime);
+  if (a) {
+    a = (m || check_relatime(&now, &uts));
+    if (!a && !c && !m) return;
+  }
+  lfs_set_utimens(lfs, path, &uts);
+}
+
+static bool lfs_file_get_utimens(lfs_t *lfs, lfs_file_t *file, struct lfs_attr_utimens *ut) {
+  return (lfs_file_getattr(lfs, file, LFS_ATTR_UTIMENS, ut, sizeof(*ut)) >= sizeof(*ut));
+}
+
+static bool lfs_file_set_utimens(lfs_t *lfs, lfs_file_t *file, const struct lfs_attr_utimens *ut) {
+  return (lfs_file_setattr(lfs, file, LFS_ATTR_UTIMENS, ut, sizeof(*ut)) == LFS_ERR_OK);
+}
+
+static void lfs_file_update_utimens(lfs_t *lfs, lfs_file_t *file, bool c, bool m, bool a) {
+  if (a && !c && !m && (s_mount_flags & ST_NOATIME)) {
+    return;
+  }
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  struct lfs_attr_utimens uts = {0};
+  if (!lfs_file_get_utimens(lfs, file, &uts)) {
+    c = m = a = true;
+  }
+  if (c) lfs_tv_to_tns(&now, &uts.ctime);
+  if (m) lfs_tv_to_tns(&now, &uts.mtime);
+  if (a) {
+    a = (m || check_relatime(&now, &uts));
+    if (!a && !c && !m) return;
+  }
+  lfs_file_set_utimens(lfs, file, &uts);
+}
+
+#define LFS_ATTR_UNIX 0x55 // 'U'
+
+struct lfs_attr_unix {
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t mode;
+} __attribute__((packed));
+
+static bool lfs_get_unix(lfs_t *lfs, const char *path, struct lfs_attr_unix *ua) {
+  return (lfs_getattr(lfs, path, LFS_ATTR_UNIX, ua, sizeof(*ua)) >= sizeof(*ua));
+}
+
+static bool lfs_set_unix(lfs_t *lfs, const char *path, const struct lfs_attr_unix *ua) {
+  return (lfs_setattr(lfs, path, LFS_ATTR_UNIX, ua, sizeof(*ua)) == LFS_ERR_OK);
+}
+
+static bool lfs_file_set_unix(lfs_t *lfs, lfs_file_t *file, const struct lfs_attr_unix *ua) {
+  return (lfs_file_setattr(lfs, file, LFS_ATTR_UNIX, ua, sizeof(*ua)) == LFS_ERR_OK);
+}
 
 // actual fuse functions
 void lfs_fuse_defaults(struct lfs_config *config) {
@@ -74,7 +198,21 @@ void lfs_fuse_defaults(struct lfs_config *config) {
     }
 }
 
+static void *get_mount_opts(void *arg) {
+    struct statvfs res = {0};
+    if (statvfs(s_mountpoint, &res) == 0) {
+        s_mount_flags = res.f_flag;
+    }
+    return NULL;
+}
+
 void *lfs_fuse_init(struct fuse_conn_info *conn) {
+
+    // it's kind of silly but this appears to be the only way
+    // to access our own mount options
+    static pthread_t stat_thr;
+    pthread_create(&stat_thr, NULL, get_mount_opts, NULL);
+
     // set that we want to take care of O_TRUNC
     conn->want |= FUSE_CAP_ATOMIC_O_TRUNC;
 
@@ -85,7 +223,7 @@ void *lfs_fuse_init(struct fuse_conn_info *conn) {
 }
 
 int lfs_fuse_stat(void) {
-    int err = lfs_fuse_bd_create(&config, device);
+    int err = lfs_fuse_bd_create(&config, device, s_key, s_key_len);
     if (err) {
         return err;
     }
@@ -138,7 +276,7 @@ failed:
 }
 
 int lfs_fuse_format(void) {
-    int err = lfs_fuse_bd_create(&config, device);
+    int err = lfs_fuse_bd_create(&config, device, s_key, s_key_len);
     if (err) {
         return err;
     }
@@ -147,12 +285,23 @@ int lfs_fuse_format(void) {
 
     err = lfs_format(&lfs, &config);
 
+    if (lfs_mount(&lfs, &config) == 0)  {
+      lfs_update_utimens(&lfs, "/", true, true, true);
+      const struct lfs_attr_unix ua = {
+        .uid = geteuid(),
+        .gid = getegid(),
+        .mode = S_IFDIR | S_IRWXU | (S_IRGRP | S_IXGRP) | (S_IROTH | S_IXOTH),
+      };
+      lfs_set_unix(&lfs, "/", &ua);
+      lfs_unmount(&lfs);
+    }
+
     lfs_fuse_bd_destroy(&config);
     return err;
 }
 
 int lfs_fuse_migrate(void) {
-    int err = lfs_fuse_bd_create(&config, device);
+    int err = lfs_fuse_bd_create(&config, device, s_key, s_key_len);
     if (err) {
         return err;
     }
@@ -166,7 +315,7 @@ int lfs_fuse_migrate(void) {
 }
 
 int lfs_fuse_mount(void) {
-    int err = lfs_fuse_bd_create(&config, device);
+    int err = lfs_fuse_bd_create(&config, device, s_key, s_key_len);
     if (err) {
         return err;
     }
@@ -227,6 +376,21 @@ int lfs_fuse_getattr(const char *path, struct stat *s) {
     }
 
     lfs_fuse_tostat(s, &info);
+
+    struct lfs_attr_utimens uts;
+    if (lfs_get_utimens(&lfs, path, &uts)) {
+      s->st_ctime = uts.ctime.sec;
+      s->st_mtime = uts.mtime.sec;
+      s->st_atime = uts.atime.sec;
+    }
+
+    struct lfs_attr_unix ua;
+    if (lfs_get_unix(&lfs, path, &ua)) {
+      s->st_uid = ua.uid;
+      s->st_gid = ua.gid;
+      s->st_mode = ua.mode;
+    }
+
     return 0;
 }
 
@@ -236,7 +400,18 @@ int lfs_fuse_access(const char *path, int mask) {
 }
 
 int lfs_fuse_mkdir(const char *path, mode_t mode) {
-    return lfs_mkdir(&lfs, path);
+    int res = lfs_mkdir(&lfs, path);
+    if (res == 0) {
+      lfs_update_utimens(&lfs, path, true, true, true);
+      struct fuse_context *ctx = fuse_get_context();
+      const struct lfs_attr_unix ua = {
+        .uid = ctx->uid,
+        .gid = ctx->gid,
+        .mode = (S_IFDIR | mode),
+      };
+      lfs_set_unix(&lfs, path, &ua);
+    }
+    return res;
 }
 
 int lfs_fuse_opendir(const char *path, struct fuse_file_info *fi) {
@@ -342,7 +517,11 @@ int lfs_fuse_read(const char *path, char *buf, size_t size,
         }
     }
 
-    return lfs_file_read(&lfs, file, buf, size);
+    int ret = lfs_file_read(&lfs, file, buf, size);
+    if (ret > 0) {
+      lfs_file_update_utimens(&lfs, file, false, false, true);
+    }
+    return ret;
 }
 
 int lfs_fuse_write(const char *path, const char *buf, size_t size,
@@ -356,7 +535,11 @@ int lfs_fuse_write(const char *path, const char *buf, size_t size,
         }
     }
 
-    return lfs_file_write(&lfs, file, buf, size);
+    int ret = lfs_file_write(&lfs, file, buf, size);
+    if (ret > 0) {
+      lfs_file_update_utimens(&lfs, file, true, true, false);
+    }
+    return ret;
 }
 
 int lfs_fuse_fsync(const char *path, int isdatasync,
@@ -375,6 +558,16 @@ int lfs_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     if (err) {
         return err;
     }
+
+    struct fuse_context *ctx = fuse_get_context();
+    lfs_file_t *file = (lfs_file_t*)fi->fh;
+    const struct lfs_attr_unix ua = {
+        .uid = ctx->uid,
+        .gid = ctx->gid,
+        .mode = mode,
+    };
+    lfs_file_set_unix(&lfs, file, &ua);
+    lfs_file_update_utimens(&lfs, file, true, true, true);
 
     return lfs_fuse_fsync(path, 0, fi);
 }
@@ -412,18 +605,30 @@ int lfs_fuse_mknod(const char *path, mode_t mode, dev_t dev) {
 }
 
 int lfs_fuse_chmod(const char *path, mode_t mode) {
-    // not supported, always succeed
+    struct lfs_attr_unix ua;
+    if (!lfs_get_unix(&lfs, path, &ua)) return -EIO;
+    ua.mode = mode;
+    if (!lfs_set_unix(&lfs, path, &ua)) return EIO;
+    lfs_update_utimens(&lfs, path, true, false, false);
     return 0;
 }
 
 int lfs_fuse_chown(const char *path, uid_t uid, gid_t gid) {
-    // not supported, fail
-    return -EPERM;
+    struct lfs_attr_unix ua;
+    if (!lfs_get_unix(&lfs, path, &ua)) return -EIO;
+    ua.uid = uid;
+    ua.gid = gid;
+    if (!lfs_set_unix(&lfs, path, &ua)) return EIO;
+    lfs_update_utimens(&lfs, path, true, false, false);
+    return 0;
 }
 
 int lfs_fuse_utimens(const char *path, const struct timespec ts[2]) {
-    // not supported, always succeed
-    return 0;
+    struct lfs_attr_utimens uts = {0};
+    lfs_get_utimens(&lfs, path, &uts);
+    lfs_ts_to_tns(&ts[1], &uts.mtime);
+    lfs_ts_to_tns(&ts[0], &uts.atime);
+    return (lfs_set_utimens(&lfs, path, &uts) ? 0 : -EIO);
 }
 
 static struct fuse_operations lfs_fuse_ops = {
@@ -459,6 +664,8 @@ static struct fuse_operations lfs_fuse_ops = {
     .chmod      = lfs_fuse_chmod,
     .chown      = lfs_fuse_chown,
     .utimens    = lfs_fuse_utimens,
+
+    .flag_nopath = true,
 };
 
 
@@ -470,6 +677,7 @@ enum lfs_fuse_keys {
     KEY_FORMAT,
     KEY_MIGRATE,
     KEY_DISK_VERSION,
+    KEY_KEY_FILE,
 };
 
 #define OPT(t, p) { t, offsetof(struct lfs_config, p), 0}
@@ -490,6 +698,8 @@ static struct fuse_opt lfs_fuse_opts[] = {
     OPT("--name_max=%"          SCNu32, name_max),
     OPT("--file_max=%"          SCNu32, file_max),
     OPT("--attr_max=%"          SCNu32, attr_max),
+    {"-k=",                     -1U, KEY_KEY_FILE},
+    {"--key=",                  -1U, KEY_KEY_FILE},
     FUSE_OPT_KEY("-V",          KEY_VERSION),
     FUSE_OPT_KEY("--version",   KEY_VERSION),
     FUSE_OPT_KEY("-h",          KEY_HELP),
@@ -520,6 +730,7 @@ static const char help_text[] =
 "    --name_max             max size of file names (255)\n"
 "    --file_max             max size of file contents (2147483647)\n"
 "    --attr_max             max size of custom attributes (1022)\n"
+"    -k   --key             encrytion key file, 32 or 64 bytes\n"
 "\n";
 
 int lfs_fuse_opt_proc(void *data, const char *arg,
@@ -531,6 +742,9 @@ int lfs_fuse_opt_proc(void *data, const char *arg,
             if (!device) {
                 device = strdup(arg);
                 return 0;
+            } else {
+                s_mountpoint = strdup(arg);
+                return 1;
             }
             break;
 
@@ -623,6 +837,30 @@ int lfs_fuse_opt_proc(void *data, const char *arg,
             fprintf(stderr, "invalid disk version: \"%s\"\n", orig_arg);
             exit(1);
         }
+
+        case KEY_KEY_FILE: {
+            const char *arg_ = strchr(arg, '=');
+            if (arg_) {
+                arg = arg_ + 1;
+            }
+            int kfd = open(arg, O_RDONLY);
+            if (kfd < 0) {
+                fprintf(stderr, "failed to open %s", arg);
+                exit(1);
+            }
+            int n = read(kfd, s_key, sizeof(s_key));
+            close(kfd);
+            if (n < 0) {
+                fprintf(stderr, "failed to read %s", arg);
+                exit(1);
+            }
+            if (n != 32 && n != 64) {
+                fprintf(stderr, "invalid key size %d", n);
+                exit(1);
+            }
+            s_key_len = n;
+            return 0;
+        }
     }
 
     return 1;
@@ -673,6 +911,13 @@ int main(int argc, char *argv[]) {
         LFS_ERROR("%s", strerror(-err));
         exit(-err);
     }
+
+    fuse_opt_add_arg(&args, "-f");
+
+    // fuse_opt_add_arg(&args, "-o");
+    // fuse_opt_add_arg(&args, "noatime");
+    // fuse_opt_add_arg(&args, "-o");
+    // fuse_opt_add_arg(&args, "allow_root");
 
     // always single-threaded
     fuse_opt_add_arg(&args, "-s");

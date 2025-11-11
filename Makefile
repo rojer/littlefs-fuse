@@ -20,15 +20,18 @@ ifdef WORD
 override CFLAGS += -m$(WORD)
 endif
 override CFLAGS += -I. -Ilittlefs
-override CFLAGS += -std=c99 -Wall -pedantic
+override CFLAGS += -std=c99 -Wall -pedantic -Werror
 override CFLAGS += -D_FILE_OFFSET_BITS=64
 override CFLAGS += -D_XOPEN_SOURCE=700
 # enable multiversion support in littlefs
 override CFLAGS += -DLFS_MULTIVERSION
 # enable migrate support in littlefs
 override CFLAGS += -DLFS_MIGRATE
+ifdef TRACE
+override CFLAGS += -DLFS_YES_TRACE
+endif
 
-override LFLAGS += -lfuse
+override LFLAGS += -lfuse -lmbedcrypto -lpthread
 
 ifeq ($(OS), FreeBSD)
 override CFLAGS += -I /usr/local/include

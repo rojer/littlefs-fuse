@@ -539,6 +539,8 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info);
 // or check for existence.
 lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
         uint8_t type, void *buffer, lfs_size_t size);
+lfs_ssize_t lfs_file_getattr(lfs_t *lfs, lfs_file_t *file,
+        uint8_t type, void *buffer, lfs_size_t size);
 
 #ifndef LFS_READONLY
 // Set custom attributes
@@ -549,6 +551,8 @@ lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
 //
 // Returns a negative error code on failure.
 int lfs_setattr(lfs_t *lfs, const char *path,
+        uint8_t type, const void *buffer, lfs_size_t size);
+int lfs_file_setattr(lfs_t *lfs, lfs_file_t *file,
         uint8_t type, const void *buffer, lfs_size_t size);
 #endif
 

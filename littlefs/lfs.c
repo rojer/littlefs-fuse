@@ -4104,6 +4104,24 @@ static int lfs_rename_(lfs_t *lfs, const char *oldpath, const char *newpath) {
 }
 #endif
 
+static lfs_ssize_t lfs_getattr_mdir_(lfs_t *lfs, lfs_mdir_t *m,
+        uint16_t id, uint8_t type, void *buffer, lfs_size_t size) {
+
+    lfs_stag_t tag = lfs_dir_get(lfs, m, LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_USERATTR + type,
+                id, lfs_min(size, lfs->attr_max)),
+            buffer);
+    if (tag < 0) {
+        if (tag == LFS_ERR_NOENT) {
+            return LFS_ERR_NOATTR;
+        }
+
+        return tag;
+    }
+
+    return lfs_tag_size(tag);
+}
+
 static lfs_ssize_t lfs_getattr_(lfs_t *lfs, const char *path,
         uint8_t type, void *buffer, lfs_size_t size) {
     lfs_mdir_t cwd;
@@ -4122,20 +4140,21 @@ static lfs_ssize_t lfs_getattr_(lfs_t *lfs, const char *path,
         }
     }
 
-    tag = lfs_dir_get(lfs, &cwd, LFS_MKTAG(0x7ff, 0x3ff, 0),
-            LFS_MKTAG(LFS_TYPE_USERATTR + type,
-                id, lfs_min(size, lfs->attr_max)),
-            buffer);
-    if (tag < 0) {
-        if (tag == LFS_ERR_NOENT) {
-            return LFS_ERR_NOATTR;
-        }
-
-        return tag;
-    }
-
-    return lfs_tag_size(tag);
+    return lfs_getattr_mdir_(lfs, &cwd, id, type, buffer, size);
 }
+
+static lfs_ssize_t lfs_file_getattr_(lfs_t *lfs, lfs_file_t *file,
+        uint8_t type, void *buffer, lfs_size_t size) {
+    return lfs_getattr_mdir_(lfs, &file->m, file->id, type, buffer, size);
+}
+
+#ifndef LFS_READONLY
+static int lfs_commitattr_mdir(lfs_t *lfs, lfs_mdir_t *m, uint16_t id,
+        uint8_t type, const void *buffer, lfs_size_t size) {
+    return lfs_dir_commit(lfs, m, LFS_MKATTRS(
+            {LFS_MKTAG(LFS_TYPE_USERATTR + type, id, size), buffer}));
+}
+#endif
 
 #ifndef LFS_READONLY
 static int lfs_commitattr(lfs_t *lfs, const char *path,
@@ -4156,8 +4175,7 @@ static int lfs_commitattr(lfs_t *lfs, const char *path,
         }
     }
 
-    return lfs_dir_commit(lfs, &cwd, LFS_MKATTRS(
-            {LFS_MKTAG(LFS_TYPE_USERATTR + type, id, size), buffer}));
+    return lfs_commitattr_mdir(lfs, &cwd, id, type, buffer, size);
 }
 #endif
 
@@ -4169,6 +4187,17 @@ static int lfs_setattr_(lfs_t *lfs, const char *path,
     }
 
     return lfs_commitattr(lfs, path, type, buffer, size);
+}
+#endif
+
+#ifndef LFS_READONLY
+static int lfs_file_setattr_(lfs_t *lfs, lfs_file_t *file,
+        uint8_t type, const void *buffer, lfs_size_t size) {
+    if (size > lfs->attr_max) {
+        return LFS_ERR_NOSPC;
+    }
+
+    return lfs_commitattr_mdir(lfs, &file->m, file->id, type, buffer, size);
 }
 #endif
 
@@ -6103,6 +6132,22 @@ lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
     return res;
 }
 
+lfs_ssize_t lfs_file_getattr(lfs_t *lfs, lfs_file_t *file,
+        uint8_t type, void *buffer, lfs_size_t size) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_file_getattr(%p, %p, %"PRIu8", %p, %"PRIu32")",
+            (void*)lfs, (void *)file, type, buffer, size);
+
+    lfs_ssize_t res = lfs_file_getattr_(lfs, file, type, buffer, size);
+
+    LFS_TRACE("lfs_file_getattr -> %"PRId32, res);
+    LFS_UNLOCK(lfs->cfg);
+    return res;
+}
+
 #ifndef LFS_READONLY
 int lfs_setattr(lfs_t *lfs, const char *path,
         uint8_t type, const void *buffer, lfs_size_t size) {
@@ -6116,6 +6161,24 @@ int lfs_setattr(lfs_t *lfs, const char *path,
     err = lfs_setattr_(lfs, path, type, buffer, size);
 
     LFS_TRACE("lfs_setattr -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
+int lfs_file_setattr(lfs_t *lfs, lfs_file_t *file,
+        uint8_t type, const void *buffer, lfs_size_t size) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_file_setattr(%p, %p, %"PRIu8", %p, %"PRIu32")",
+            (void*)lfs, (void *)file, type, buffer, size);
+
+    err = lfs_file_setattr_(lfs, file, type, buffer, size);
+
+    LFS_TRACE("lfs_file_setattr -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }

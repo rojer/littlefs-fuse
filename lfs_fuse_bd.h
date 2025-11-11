@@ -12,7 +12,7 @@
 
 
 // Create a block device with path to dev block device
-int lfs_fuse_bd_create(struct lfs_config *cfg, const char *path);
+int lfs_fuse_bd_create(struct lfs_config *cfg, const char *path, const void *key, lfs_size_t key_len);
 
 // Clean up memory associated with emu block device
 void lfs_fuse_bd_destroy(const struct lfs_config *cfg);
